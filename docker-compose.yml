@@ -1,0 +1,113 @@
+version: '3.8'
+
+services:
+  # PostgreSQL Database
+  postgres:
+    image: postgres:15
+    container_name: fraud-postgres
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-fraud_detection}
+      POSTGRES_USER: ${POSTGRES_USER:-fraud_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-fraud_pass}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./docker/init.sql:/docker-entrypoint-initdb.d/init.sql
+    networks:
+      - fraud-network
+
+  # Zookeeper (required for Kafka)
+  zookeeper:
+    image: confluentinc/cp-zookeeper:latest
+    container_name: fraud-zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+    ports:
+      - "2181:2181"
+    networks:
+      - fraud-network
+
+  # Apache Kafka
+  kafka:
+    image: confluentinc/cp-kafka:latest
+    container_name: fraud-kafka
+    depends_on:
+      - zookeeper
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+    ports:
+      - "9092:9092"
+    networks:
+      - fraud-network
+
+  # MLflow Tracking Server
+  mlflow:
+    image: python:3.11-slim
+    container_name: fraud-mlflow
+    volumes:
+      - ./mlflow_artifacts:/mlflow/artifacts
+      - ./mlruns:/mlruns
+    command: >
+      sh -c "pip install mlflow==2.9.2 &&
+             mlflow server 
+             --host 0.0.0.0 
+             --port 5000 
+             --artifacts-root /mlflow/artifacts 
+             --backend-store-uri sqlite:///mlruns/mlflow.db"
+    ports:
+      - "5000:5000"
+    networks:
+      - fraud-network
+    depends_on:
+      - postgres
+
+  # FastAPI Application
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: fraud-api
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=postgresql://fraud_user:fraud_pass@postgres:5432/fraud_detection
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+      - MLFLOW_TRACKING_URI=http://mlflow:5000
+    depends_on:
+      - postgres
+      - kafka
+      - mlflow
+    networks:
+      - fraud-network
+    volumes:
+      - ./models:/app/models
+    restart: unless-stopped
+
+  # Streamlit Dashboard
+  dashboard:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: fraud-dashboard
+    ports:
+      - "8501:8501"
+    command: streamlit run dashboard/app.py --server.address 0.0.0.0 --server.port 8501
+    environment:
+      - API_URL=http://api:8000
+    depends_on:
+      - api
+    networks:
+      - fraud-network
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  mlflow_artifacts:
+
+networks:
+  fraud-network:
+    driver: bridge
